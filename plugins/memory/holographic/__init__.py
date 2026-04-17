@@ -240,6 +240,110 @@ class HolographicMemoryProvider(MemoryProvider):
             return
         self._auto_extract_facts(messages)
 
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Called before context compression — snapshot project state to disk.
+
+        Writes the current in-progress task summary to the active project's
+        progress.md so that state survives context compression without loss.
+        Also triggers LLM-based fact extraction so facts are persisted before
+        context is compressed.
+        Returns an empty string (no contribution to the compressor prompt).
+        """
+        try:
+            self._flush_project_state(messages)
+        except Exception as e:
+            logger.debug("Holographic on_pre_compress project flush failed: %s", e)
+        # Auto-extract facts before compression if configured
+        if self._config.get("auto_extract", False) and self._store and messages:
+            try:
+                self._auto_extract_facts(messages)
+            except Exception as e:
+                logger.debug("Holographic on_pre_compress auto-extract failed: %s", e)
+        return ""
+
+    def _flush_project_state(self, messages: List[Dict[str, Any]]) -> None:
+        """Extract structured project state snapshot and append to compress log."""
+        from pathlib import Path
+        from hermes_constants import get_hermes_home
+        from datetime import datetime
+
+        index_path = get_hermes_home() / "projects" / "_compress_log.md"
+
+        # Build a brief digest of the last few turns
+        assistant_msgs = []
+        user_msgs = []
+        for msg in reversed(messages[-30:]):
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if role == "assistant" and len(assistant_msgs) < 5:
+                assistant_msgs.append(content.strip())
+            elif role == "user" and len(user_msgs) < 3:
+                user_msgs.append(content.strip())
+
+        if not assistant_msgs and not user_msgs:
+            return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        # Detect in-progress tasks from recent assistant messages
+        in_progress = []
+        completed = []
+        todos = []
+        key_facts = []
+        for msg in reversed(assistant_msgs):
+            lines = msg.split("\n")
+            for line in lines:
+                l = line.strip()
+                if not l:
+                    continue
+                if any(kw in l.lower() for kw in ["正在", "進行中", "working on", "in progress", "開始"]):
+                    in_progress.append(l[:120])
+                elif any(kw in l.lower() for kw in ["完成", "done", "✅", "finished", "已"]):
+                    completed.append(l[:120])
+                elif any(kw in l.lower() for kw in ["待辦", "todo", "下一步", "next step", "[ ]"]):
+                    todos.append(l[:120])
+                elif any(kw in l.lower() for kw in ["發現", "注意", "重要", "關鍵", "error", "issue", "bug", "found"]):
+                    key_facts.append(l[:120])
+
+        # Fallback: use first assistant message excerpt
+        if not in_progress and not completed:
+            in_progress = [assistant_msgs[0][:200]] if assistant_msgs else ["（無法判斷）"]
+
+        entry = f"\n## {timestamp} — pre-compression snapshot\n"
+        entry += "### 當前專案狀態\n"
+        entry += "- 正在進行：" + (in_progress[0] if in_progress else "（無）") + "\n"
+        entry += "- 最近完成：" + (completed[0] if completed else "（無）") + "\n"
+        if len(completed) > 1:
+            for c in completed[1:3]:
+                entry += f"  - {c}\n"
+
+        entry += "### 關鍵事實\n"
+        if key_facts:
+            for f in key_facts[:3]:
+                entry += f"- {f}\n"
+        else:
+            # Use recent user request as context
+            if user_msgs:
+                entry += f"- 用戶請求：{user_msgs[0][:150]}\n"
+            else:
+                entry += "- （本次對話無明顯新事實）\n"
+
+        entry += "### 待辦事項\n"
+        if todos:
+            for t in todos[:3]:
+                entry += f"- {t}\n"
+        else:
+            entry += "- （請查閱 todo 清單）\n"
+
+        entry += "\n"
+
+        # Append to compress log
+        existing = index_path.read_text(encoding="utf-8") if index_path.exists() else "# Hermes Compression Log\n\n"
+        index_path.write_text(existing + entry, encoding="utf-8")
+        logger.info("Holographic: flushed structured project state to %s", index_path)
+
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes as facts."""
         if action == "add" and self._store and content:
@@ -356,6 +460,101 @@ class HolographicMemoryProvider(MemoryProvider):
     # -- Auto-extraction (on_session_end) ------------------------------------
 
     def _auto_extract_facts(self, messages: list) -> None:
+        """Extract facts from conversation using LLM-based analysis.
+
+        Primary method: call LLM with a structured prompt to identify
+        durable facts worth storing (preferences, decisions, configs, discoveries).
+        Falls back to English regex patterns if LLM call fails.
+        """
+        # Try LLM-based extraction first
+        try:
+            extracted = self._llm_extract_facts(messages)
+            if extracted > 0:
+                logger.info("LLM auto-extracted %d facts from conversation", extracted)
+                return
+        except Exception as e:
+            logger.warning("LLM-based fact extraction failed, falling back to regex: %s", e)
+
+        # Fallback: English regex patterns
+        self._regex_extract_facts(messages)
+
+    def _llm_extract_facts(self, messages: list) -> int:
+        """Call LLM to extract facts from the last 20 messages. Returns count of facts added."""
+        from agent.auxiliary_client import call_llm
+
+        # Take last 20 messages with role+content
+        recent = []
+        for msg in messages[-20:]:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if role in ("user", "assistant", "system"):
+                recent.append({"role": role, "content": content.strip()[:500]})
+
+        if not recent:
+            return 0
+
+        # Format conversation for the prompt
+        conv_text = "\n".join(
+            f"[{m['role']}]: {m['content']}" for m in recent
+        )
+
+        system_prompt = (
+            "你是一個記憶萃取助手。分析以下對話片段，萃取值得長期記憶的事實。\n"
+            "只萃取具體、可驗證、對未來有用的事實（偏好、決策、設定、發現）。\n"
+            "不萃取任務進度、暫時狀態、對話過程、問候語。\n"
+            "用繁體中文輸出，格式為 JSON 陣列：\n"
+            '[{"content": "事實描述", "category": "user_pref|project|tool|general", "tags": "tag1,tag2"}]\n'
+            "若無值得萃取的事實，輸出空陣列 []。\n"
+            "只輸出 JSON，不要有任何其他文字。"
+        )
+
+        user_prompt = f"以下是對話內容：\n\n{conv_text}\n\n請萃取值得長期記憶的事實："
+
+        response = call_llm(
+            task="flush_memories",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1024,
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        # Parse JSON response
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+        facts = json.loads(raw)
+        if not isinstance(facts, list):
+            return 0
+
+        extracted = 0
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            content = fact.get("content", "").strip()
+            if not content:
+                continue
+            category = fact.get("category", "general")
+            if category not in ("user_pref", "project", "tool", "general"):
+                category = "general"
+            tags = fact.get("tags", "")
+            try:
+                self._store.add_fact(content, category=category, tags=tags)
+                extracted += 1
+            except Exception as e:
+                logger.debug("Failed to store extracted fact: %s", e)
+
+        return extracted
+
+    def _regex_extract_facts(self, messages: list) -> None:
+        """Fallback: English regex-based fact extraction (original logic)."""
         _PREF_PATTERNS = [
             re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
@@ -393,7 +592,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     break
 
         if extracted:
-            logger.info("Auto-extracted %d facts from conversation", extracted)
+            logger.info("Regex fallback auto-extracted %d facts from conversation", extracted)
 
 
 # ---------------------------------------------------------------------------
