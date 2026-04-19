@@ -376,6 +376,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
 
+    # SYS004: Save message_id → cron job mapping for standalone path too
+    if result and platform_name.lower() == "telegram":
+        _mid = result.get("message_id")
+        if _mid:
+            try:
+                from gateway.cron_message_map import save_message_mapping
+                _out_path = job.get("_output_path", "")
+                save_message_mapping(
+                    message_id=str(_mid),
+                    job_id=job.get("id", ""),
+                    job_name=job.get("name", ""),
+                    run_at=_hermes_now().isoformat(),
+                    session_id=job.get("_session_id", ""),
+                    output_path=_out_path,
+                )
+            except Exception as _me:
+                logger.debug("Job '%s': cron_message_map save (standalone) failed: %s", job["id"], _me)
+
     logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
     return None
 
