@@ -112,6 +112,33 @@ def lookup_message(message_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+class CronMessageMap:
+    """High-level helper wrapping the cron message map functions."""
+
+    def record(
+        self,
+        message_id: str,
+        job_id: str,
+        job_name: str,
+        run_at: str,
+        session_id: str,
+        output_path: str,
+    ) -> bool:
+        """Record a telegram_message_id → cron job mapping."""
+        return save_message_mapping(
+            message_id=message_id,
+            job_id=job_id,
+            job_name=job_name,
+            run_at=run_at,
+            session_id=session_id,
+            output_path=output_path,
+        )
+
+    def lookup(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """Look up cron job metadata by Telegram message_id."""
+        return lookup_message(message_id)
+
+
 def get_output_content(entry: Dict[str, Any]) -> Optional[str]:
     """
     Read and return the output file content for a mapping entry.

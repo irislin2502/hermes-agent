@@ -7186,6 +7186,14 @@ class AIAgent:
             self._current_tool = function_name
             self._touch_activity(f"executing tool: {function_name}")
 
+            # Structured activity log
+            try:
+                from tools.agent_activity_log import log_tool_start
+                _args_preview = str(function_args)[:200]
+                log_tool_start(function_name, _args_preview, getattr(tool_call, "id", ""))
+            except Exception:
+                pass
+
             # Set activity callback for long-running tool execution (terminal
             # commands, etc.) so the gateway's inactivity monitor doesn't kill
             # the agent while a command is running.
@@ -7425,6 +7433,18 @@ class AIAgent:
 
             self._current_tool = None
             self._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
+
+            # Structured activity log
+            try:
+                from tools.agent_activity_log import log_tool_end
+                _result_preview = function_result[:200] if isinstance(function_result, str) else str(function_result)[:200]
+                log_tool_end(
+                    function_name, _result_preview,
+                    tool_call_id=getattr(tool_call, "id", ""),
+                    error=result_preview if _is_error_result else "",
+                )
+            except Exception:
+                pass
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")

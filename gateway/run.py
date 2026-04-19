@@ -3070,8 +3070,13 @@ class GatewayRunner:
                     _cron_content = get_output_content(_cron_entry)
                     if _cron_content:
                         _job_name = _cron_entry.get("job_name", _cron_entry.get("job_id", "cron job"))
+                        _run_at = _cron_entry.get("run_at", "unknown")
                         message_text = (
-                            f"[Full cron output for '{_job_name}':\n{_cron_content}]\n\n{message_text}"
+                            f"[Full cron output for job '{_job_name}' (ran at {_run_at})]:\n"
+                            f"{_cron_content}\n\n"
+                            f"---\n"
+                            f"[User reply]:\n"
+                            f"{message_text}"
                         )
                         logger.debug(
                             "SYS004: Attached full cron output for message_id=%s job=%s",
