@@ -3061,6 +3061,25 @@ class GatewayRunner:
             if not found_in_history:
                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
+        # SYS004: If the user replied to a cron job report, attach the full output as context
+        if getattr(event, "reply_to_message_id", None) and source.platform.value == "telegram":
+            try:
+                from gateway.cron_message_map import lookup_message, get_output_content
+                _cron_entry = lookup_message(str(event.reply_to_message_id))
+                if _cron_entry:
+                    _cron_content = get_output_content(_cron_entry)
+                    if _cron_content:
+                        _job_name = _cron_entry.get("job_name", _cron_entry.get("job_id", "cron job"))
+                        message_text = (
+                            f"[Full cron output for '{_job_name}':\n{_cron_content}]\n\n{message_text}"
+                        )
+                        logger.debug(
+                            "SYS004: Attached full cron output for message_id=%s job=%s",
+                            event.reply_to_message_id, _job_name,
+                        )
+            except Exception as _cme:
+                logger.debug("SYS004: cron_message_map lookup failed: %s", _cme)
+
         if "@" in message_text:
             try:
                 from agent.context_references import preprocess_context_references_async
@@ -8484,6 +8503,20 @@ class GatewayRunner:
                     _last_desc, _iter_n, _iter_max,
                     _cur_tool or "none",
                 )
+
+                # Write structured log for post-mortem analysis
+                try:
+                    from tools.agent_activity_log import log_gateway_timeout
+                    log_gateway_timeout(
+                        session_key=session_key,
+                        idle_secs=_secs_ago,
+                        timeout=_agent_timeout,
+                        last_activity=_last_desc,
+                        iteration=_iter_n,
+                        tool=_cur_tool or "none",
+                    )
+                except Exception:
+                    pass
 
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.

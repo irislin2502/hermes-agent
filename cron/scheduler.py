@@ -328,6 +328,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
             if adapter_ok:
                 logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
+                # Save message_id → cron job mapping so replies can attach full output context
+                if send_result and platform_name.lower() == "telegram":
+                    _mid = getattr(send_result, "message_id", None)
+                    if _mid:
+                        try:
+                            from gateway.cron_message_map import save_message_mapping
+                            _out_path = job.get("_output_path", "")
+                            save_message_mapping(
+                                message_id=str(_mid),
+                                job_id=job.get("id", ""),
+                                job_name=job.get("name", ""),
+                                run_at=_hermes_now().isoformat(),
+                                session_id=job.get("_session_id", ""),
+                                output_path=_out_path,
+                            )
+                        except Exception as _me:
+                            logger.debug("Job '%s': cron_message_map save failed: %s", job["id"], _me)
                 return None
         except Exception as e:
             logger.warning(
@@ -949,6 +966,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 output_file = save_job_output(job["id"], output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
+
+                # Stash output_path and session_id on job dict so _deliver_result
+                # can access them for the cron_message_map without changing its signature.
+                job["_output_path"] = str(output_file) if output_file else ""
+                job["_session_id"] = _cron_session_id
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
