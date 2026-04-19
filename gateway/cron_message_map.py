@@ -6,11 +6,14 @@ Schema:
     "<telegram_message_id>": {
         "job_id": str,
         "job_name": str,
-        "run_at": str,        # ISO-8601 timestamp
+        "run_at": str,             # ISO-8601 timestamp
         "session_id": str,
-        "output_path": str    # absolute path to the saved output file
+        "full_output_path": str    # absolute path to the saved output file
     }
 }
+
+Note: the JSON key is stored as ``full_output_path`` (alias: ``output_path`` for
+backward compatibility — both keys are checked during lookup).
 
 File location: ~/.hermes/cron/message_map.json
 """
@@ -70,7 +73,7 @@ def save_message_mapping(
             "job_name": job_name,
             "run_at": run_at,
             "session_id": session_id,
-            "output_path": output_path,
+            "full_output_path": output_path,
         }
         # Prune oldest entries if we exceed the cap
         if len(data) > _MAX_ENTRIES:
@@ -145,7 +148,7 @@ def get_output_content(entry: Dict[str, Any]) -> Optional[str]:
 
     Returns None if the file doesn't exist or cannot be read.
     """
-    output_path = entry.get("output_path", "")
+    output_path = entry.get("full_output_path") or entry.get("output_path", "")
     if not output_path:
         return None
     try:
