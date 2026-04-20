@@ -109,6 +109,18 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+
+        # Update retrieval_count for returned facts
+        if results:
+            ids = [f["fact_id"] for f in results]
+            placeholders = ",".join("?" * len(ids))
+            with self.store._lock:
+                self.store._conn.execute(
+                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE fact_id IN ({placeholders})",
+                    ids,
+                )
+                self.store._conn.commit()
+
         return results
 
     def probe(
