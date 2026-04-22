@@ -1067,10 +1067,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
+            # Escape backticks and backslashes inside code span to avoid MARKDOWN parse errors
+            cmd_escaped = cmd_preview.replace("\\", "\\\\").replace("`", "\\`")
+            # Also escape * _ [ ] ( ) ~ > # + - = | { } . ! for MARKDOWN mode safety
+            import re as _re
+            desc_escaped = _re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', description)
             text = (
                 f"⚠️ *Command Approval Required*\n\n"
-                f"`{cmd_preview}`\n\n"
-                f"Reason: {description}"
+                f"`{cmd_escaped}`\n\n"
+                f"Reason: {desc_escaped}"
             )
 
             # Resolve thread context for thread replies
