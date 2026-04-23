@@ -81,6 +81,25 @@ _UNHELPFUL_DELTA = -0.10
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
 
+# Layer A deduplication: token Jaccard similarity threshold
+# Facts with Jaccard similarity >= this value are considered duplicates at write time.
+_DEDUP_JACCARD_THRESHOLD = 0.85
+
+
+def _tokenize(text: str) -> set[str]:
+    """Simple whitespace + punctuation tokenizer. Returns a set of lowercase tokens."""
+    import re as _re
+    return set(_re.findall(r'\w+', text.lower()))
+
+
+def _jaccard_similarity(a: set[str], b: set[str]) -> float:
+    """Return Jaccard similarity between two token sets."""
+    if not a and not b:
+        return 1.0
+    intersection = len(a & b)
+    union = len(a | b)
+    return intersection / union if union else 0.0
+
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
@@ -144,6 +163,7 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
+        trust_score: float | None = None,
     ) -> int:
         """Insert a fact and return its fact_id.
 
@@ -156,13 +176,32 @@ class MemoryStore:
             if not content:
                 raise ValueError("content must not be empty")
 
+            # Layer A deduplication guard: check token Jaccard similarity
+            # against recent/same-category facts to block near-duplicate writes.
+            new_tokens = _tokenize(content)
+            candidate_rows = self._conn.execute(
+                "SELECT fact_id, content FROM facts WHERE category = ? ORDER BY fact_id DESC LIMIT 500",
+                (category,),
+            ).fetchall()
+            for row in candidate_rows:
+                existing_tokens = _tokenize(row["content"])
+                sim = _jaccard_similarity(new_tokens, existing_tokens)
+                if sim >= _DEDUP_JACCARD_THRESHOLD:
+                    logger.debug(
+                        "[Layer-A dedup] Blocked near-duplicate (Jaccard=%.3f): %r ≈ %r",
+                        sim,
+                        content[:60],
+                        row["content"][:60],
+                    )
+                    return int(row["fact_id"])
+
             try:
                 cur = self._conn.execute(
                     """
                     INSERT INTO facts (content, category, tags, trust_score)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (content, category, tags, self.default_trust),
+                    (content, category, tags, _clamp_trust(trust_score) if trust_score is not None else self.default_trust),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]

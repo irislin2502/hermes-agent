@@ -504,8 +504,12 @@ class HolographicMemoryProvider(MemoryProvider):
             "你是一個記憶萃取助手。分析以下對話片段，萃取值得長期記憶的事實。\n"
             "只萃取具體、可驗證、對未來有用的事實（偏好、決策、設定、發現）。\n"
             "不萃取任務進度、暫時狀態、對話過程、問候語。\n"
+            "為每個事實評估信任度（trust_score）：\n"
+            "  - 0.9：高確定性事實（使用者明確陳述的偏好、已確認的設定、明確的決策）\n"
+            "  - 0.7：中高確定性（有明確證據支持、直接觀察到的行為）\n"
+            "  - 0.5：中等確定性（推斷或間接資訊）\n"
             "用繁體中文輸出，格式為 JSON 陣列：\n"
-            '[{"content": "事實描述", "category": "user_pref|project|tool|general", "tags": "tag1,tag2"}]\n'
+            '[{"content": "事實描述", "category": "user_pref|project|tool|general", "tags": "tag1,tag2", "trust_score": 0.9}]\n'
             "若無值得萃取的事實，輸出空陣列 []。\n"
             "只輸出 JSON，不要有任何其他文字。"
         )
@@ -545,8 +549,10 @@ class HolographicMemoryProvider(MemoryProvider):
             if category not in ("user_pref", "project", "tool", "general"):
                 category = "general"
             tags = fact.get("tags", "")
+            raw_trust = fact.get("trust_score", None)
+            trust = float(raw_trust) if raw_trust is not None else None
             try:
-                self._store.add_fact(content, category=category, tags=tags)
+                self._store.add_fact(content, category=category, tags=tags, trust_score=trust)
                 extracted += 1
             except Exception as e:
                 logger.debug("Failed to store extracted fact: %s", e)
