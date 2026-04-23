@@ -504,10 +504,20 @@ class HolographicMemoryProvider(MemoryProvider):
             "你是一個記憶萃取助手。分析以下對話片段，萃取值得長期記憶的事實。\n"
             "只萃取具體、可驗證、對未來有用的事實（偏好、決策、設定、發現）。\n"
             "不萃取任務進度、暫時狀態、對話過程、問候語。\n"
+            "\n"
+            "【系統操作類事實的特別規則】\n"
+            "以下類型的事實只有在 trust_score >= 0.6 時才應存入，否則直接跳過：\n"
+            "  - CUA 操作記錄（截圖、點擊、GUI 操作步驟）\n"
+            "  - Agent prompt 修改記錄（Director/Builder/Inspector 的 prompt 更新）\n"
+            "  - Scheduler 更新（cron job 設定變更）\n"
+            "  - 純技術操作記錄（非決策性質，只是描述「做了什麼動作」）\n"
+            "如果是系統操作但沒有長期參考價值（如一次性的 GUI 點擊、已完成的臨時任務），直接不萃取。\n"
+            "\n"
             "為每個事實評估信任度（trust_score）：\n"
             "  - 0.9：高確定性事實（使用者明確陳述的偏好、已確認的設定、明確的決策）\n"
-            "  - 0.7：中高確定性（有明確證據支持、直接觀察到的行為）\n"
-            "  - 0.5：中等確定性（推斷或間接資訊）\n"
+            "  - 0.7：中高確定性（有明確證據支持、直接觀察到的行為、已驗證的技術設定）\n"
+            "  - 0.6：系統操作類中等確定性（有長期參考價值的工具設定、架構決策）\n"
+            "  - 0.5：中等確定性（推斷或間接資訊）— 系統操作類不得使用此分數\n"
             "用繁體中文輸出，格式為 JSON 陣列：\n"
             '[{"content": "事實描述", "category": "user_pref|project|tool|general", "tags": "tag1,tag2", "trust_score": 0.9}]\n'
             "若無值得萃取的事實，輸出空陣列 []。\n"
@@ -551,6 +561,14 @@ class HolographicMemoryProvider(MemoryProvider):
             tags = fact.get("tags", "")
             raw_trust = fact.get("trust_score", None)
             trust = float(raw_trust) if raw_trust is not None else None
+            # Enforce: system operation facts (tool category) must have trust >= 0.6
+            _sys_op_keywords = ("cua", "截圖", "點擊", "prompt 修改", "scheduler", "cron", "gui 操作",
+                                "agent prompt", "director", "builder", "inspector")
+            if trust is not None and trust < 0.6:
+                content_lower = content.lower()
+                if any(kw in content_lower for kw in _sys_op_keywords):
+                    logger.debug("Skipping system-op fact with low trust (%.1f): %s", trust, content[:80])
+                    continue
             try:
                 self._store.add_fact(content, category=category, tags=tags, trust_score=trust)
                 extracted += 1
