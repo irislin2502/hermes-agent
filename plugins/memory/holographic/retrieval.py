@@ -517,6 +517,8 @@ class FactRetriever:
         where_clauses.append("f.trust_score >= ?")
         params.append(min_trust)
 
+        where_clauses.append("f.is_deleted = 0")
+
         where_sql = " AND ".join(where_clauses)
 
         sql = f"""
