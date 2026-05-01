@@ -1557,6 +1557,43 @@ class GatewayRunner:
             except Exception as e:
                 logger.warning("Session suspension on startup failed: %s", e)
 
+        # Clean up stale pending_intents on startup — intents that are still
+        # in 'received' state after 4 hours are orphaned (the gateway restarted
+        # before they could be resolved, and the in-memory intent_id is gone).
+        try:
+            import json as _json
+            _intent_file = Path(_hermes_home) / "inspector" / "pending_intents.json"
+            if _intent_file.exists():
+                with open(_intent_file) as _f:
+                    _intent_data = _json.load(_f)
+                _stale_threshold_hours = 4
+                _now = datetime.utcnow()
+                _stale_count = 0
+                for _intent in _intent_data.get("intents", []):
+                    if _intent.get("status") != "received":
+                        continue
+                    try:
+                        _received_at = datetime.fromisoformat(
+                            _intent["received_at"].rstrip("Z")
+                        )
+                        _age_hours = (_now - _received_at).total_seconds() / 3600
+                        if _age_hours >= _stale_threshold_hours:
+                            _intent["status"] = "stale"
+                            _intent["stale_marked_at"] = _now.isoformat() + "Z"
+                            _stale_count += 1
+                    except Exception:
+                        pass
+                if _stale_count:
+                    _intent_data["updated_at"] = _now.isoformat() + "Z"
+                    with open(_intent_file, "w") as _f:
+                        _json.dump(_intent_data, _f, ensure_ascii=False, indent=2)
+                    logger.info(
+                        "Marked %d stale pending intent(s) (>%dh old) on startup",
+                        _stale_count, _stale_threshold_hours,
+                    )
+        except Exception as _e:
+            logger.warning("Stale intent cleanup on startup failed: %s", _e)
+
         connected_count = 0
         enabled_platform_count = 0
         startup_nonretryable_errors: list[str] = []
@@ -2257,6 +2294,76 @@ class GatewayRunner:
 
         return None
     
+    def _log_incoming_intent(self, event: "MessageEvent", source) -> Optional[str]:
+        """Persist incoming user message to pending_intents.json before processing.
+
+        Returns the intent id (used later to mark it done), or None on failure.
+        This is a best-effort operation — any exception is silently swallowed
+        so it never blocks the main message handling flow.
+        """
+        try:
+            import uuid as _uuid
+            import json as _json
+            intent_file = Path(_hermes_home) / "inspector" / "pending_intents.json"
+            intent_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Load existing intents
+            if intent_file.exists():
+                try:
+                    with open(intent_file) as f:
+                        data = _json.load(f)
+                except Exception:
+                    data = {"intents": []}
+            else:
+                data = {"intents": []}
+
+            # Skip slash commands and cron/internal messages (not user intents)
+            text = (event.text or "").strip()
+            if not text or text.startswith("/") or getattr(event, "internal", False):
+                return None
+
+            intent_id = _uuid.uuid4().hex[:12]
+            intent = {
+                "id": intent_id,
+                "platform": source.platform.value if source.platform else "unknown",
+                "user": source.user_name or str(source.user_id),
+                "message": text[:500],  # cap at 500 chars
+                "received_at": datetime.utcnow().isoformat() + "Z",
+                "status": "received",
+                "session_key": self._session_key_for_source(source),
+            }
+            data["intents"].append(intent)
+            data["updated_at"] = datetime.utcnow().isoformat() + "Z"
+
+            with open(intent_file, "w") as f:
+                _json.dump(data, f, ensure_ascii=False, indent=2)
+            return intent_id
+        except Exception as e:
+            logger.debug("_log_incoming_intent failed (non-fatal): %s", e)
+            return None
+
+    def _resolve_intent(self, intent_id: Optional[str]) -> None:
+        """Mark a previously logged intent as done after successful processing."""
+        if not intent_id:
+            return
+        try:
+            import json as _json
+            intent_file = Path(_hermes_home) / "inspector" / "pending_intents.json"
+            if not intent_file.exists():
+                return
+            with open(intent_file) as f:
+                data = _json.load(f)
+            for intent in data.get("intents", []):
+                if intent.get("id") == intent_id:
+                    intent["status"] = "done"
+                    intent["resolved_at"] = datetime.utcnow().isoformat() + "Z"
+                    break
+            data["updated_at"] = datetime.utcnow().isoformat() + "Z"
+            with open(intent_file, "w") as f:
+                _json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.debug("_resolve_intent failed (non-fatal): %s", e)
+
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
@@ -2432,6 +2539,12 @@ class GatewayRunner:
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        # --- Intent log: persist incoming message before any processing ---
+        # This ensures that if the gateway crashes or hangs after receiving a
+        # message but before the agent runs, the intent is not silently lost.
+        # The intent is marked 'done' after the response is sent.
+        _intent_id = self._log_incoming_intent(event, source)
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -3819,6 +3932,7 @@ class GatewayRunner:
                         )
                 return None
 
+            self._resolve_intent(_intent_id)
             return response
             
         except Exception as e:
