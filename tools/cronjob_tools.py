@@ -257,6 +257,34 @@ def cronjob(
                 if script_error:
                     return tool_error(script_error, success=False)
 
+            # Idempotency check: if a job with the same name already exists,
+            # return it immediately without creating a duplicate.  This prevents
+            # repeated "Cron job created" notifications when Builder re-runs
+            # and calls create for jobs that were already set up.
+            if name:
+                existing_jobs = list_jobs(include_disabled=True)
+                existing = next(
+                    (j for j in existing_jobs if j.get("name") == name), None
+                )
+                if existing:
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "job_id": existing["id"],
+                            "name": existing["name"],
+                            "skill": existing.get("skill"),
+                            "skills": existing.get("skills", []),
+                            "schedule": existing.get("schedule_display", ""),
+                            "repeat": _repeat_display(existing),
+                            "deliver": existing.get("deliver", "local"),
+                            "next_run_at": existing.get("next_run_at"),
+                            "job": _format_job(existing),
+                            "message": f"Cron job '{existing['name']}' already exists (id={existing['id']}); skipped creation.",
+                            "already_exists": True,
+                        },
+                        indent=2,
+                    )
+
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
