@@ -1161,6 +1161,149 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return tool_error(error_msg)
 
 
+# ── SPA/CSR site detection and Playwright fallback ──────────────────────────
+
+_SPA_DOMAINS = {
+    "cake.me",
+    "www.cake.me",
+    "linkedin.com",
+    "www.linkedin.com",
+    "glassdoor.com",
+    "www.glassdoor.com",
+    "notion.so",
+    "www.notion.so",
+    "figma.com",
+    "www.figma.com",
+}
+
+
+def _is_spa_url(url: str) -> bool:
+    """Return True if the URL is known to require JavaScript rendering."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+        return host in _SPA_DOMAINS
+    except Exception:
+        return False
+
+
+def _playwright_extract_sync(url: str) -> Dict[str, Any]:
+    """Fetch a dynamically rendered page using Playwright headless Chromium."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            page.goto(url, wait_until="networkidle", timeout=20000)
+            title = page.title()
+            content = page.inner_text("body")
+            browser.close()
+        logger.info("Playwright extracted %d chars from %s (title: %s)", len(content), url, title)
+        return {"url": url, "title": title, "content": content, "raw_content": content, "error": None}
+    except Exception as e:
+        logger.warning("Playwright extraction failed for %s: %s", url, e)
+        return {"url": url, "title": "", "content": "", "raw_content": "", "error": str(e)}
+
+
+# ─── SPA / CSR Playwright fallback ───────────────────────────────────────────
+
+# Known client-side-rendered / SPA domains that yield empty HTML without JS execution.
+_SPA_DOMAINS = {
+    "cake.me",
+    "linkedin.com",
+    "www.linkedin.com",
+    "jobs.lever.co",
+    "greenhouse.io",
+    "boards.greenhouse.io",
+    "workable.com",
+    "apply.workable.com",
+    "notion.so",
+    "www.notion.so",
+    "glassdoor.com",
+    "www.glassdoor.com",
+    "indeed.com",
+    "www.indeed.com",
+    "104.com.tw",
+    "www.104.com.tw",
+    "1111.com.tw",
+    "www.1111.com.tw",
+    "yourator.co",
+    "www.yourator.co",
+}
+
+
+def _is_spa_url(url: str) -> bool:
+    """Return True when *url* belongs to a known SPA/CSR domain."""
+    from urllib.parse import urlparse
+    try:
+        host = urlparse(url).netloc.lower()
+        # Strip port number if present
+        host = host.split(":")[0]
+        return host in _SPA_DOMAINS
+    except Exception:
+        return False
+
+
+def _playwright_extract_sync(url: str, timeout_ms: int = 30000) -> Dict[str, Any]:
+    """Use Playwright (headless Chromium) to fully render a SPA page and extract its content.
+
+    Returns a document dict compatible with the standard extraction result format:
+    ``{url, title, content, raw_content, metadata}``.
+    Falls back to an error dict on failure.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        import re as _re
+
+        logger.info("Playwright SPA extract: %s", url)
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 900},
+                )
+                page = context.new_page()
+                page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                title = page.title()
+                # Extract visible text content via innerText (skips script/style)
+                html = page.content()
+                raw_text = page.evaluate("() => document.body ? document.body.innerText : ''")
+                # Clean up excessive whitespace
+                raw_text = _re.sub(r"\n{3,}", "\n\n", raw_text).strip()
+            finally:
+                browser.close()
+
+        return {
+            "url": url,
+            "title": title,
+            "content": raw_text,
+            "raw_content": raw_text,
+            "metadata": {
+                "sourceURL": url,
+                "title": title,
+                "extraction_method": "playwright",
+            },
+        }
+
+    except Exception as exc:
+        logger.warning("Playwright extract failed for %s: %s", url, exc)
+        return {
+            "url": url,
+            "title": "",
+            "content": "",
+            "raw_content": "",
+            "error": f"Playwright extraction failed: {exc}",
+            "metadata": {"sourceURL": url},
+        }
+
+
 async def web_extract_tool(
     urls: List[str],
     format: str = None,
@@ -1238,124 +1381,137 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
-            backend = _get_backend()
-
-            if backend == "parallel":
-                results = await _parallel_extract(safe_urls)
-            elif backend == "exa":
-                results = _exa_extract(safe_urls)
-            elif backend == "tavily":
-                logger.info("Tavily extract: %d URL(s)", len(safe_urls))
-                raw = _tavily_request("extract", {
-                    "urls": safe_urls,
-                    "include_images": False,
-                })
-                results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
-            else:
-                # ── Firecrawl extraction ──
-                # Determine requested formats for Firecrawl v2
-                formats: List[str] = []
-                if format == "markdown":
-                    formats = ["markdown"]
-                elif format == "html":
-                    formats = ["html"]
+            # ── Playwright fallback for known SPA/CSR sites ──
+            spa_results, remaining_urls = [], []
+            for url in safe_urls:
+                if _is_spa_url(url):
+                    spa_results.append(_playwright_extract_sync(url))
                 else:
-                    # Default: request markdown for LLM-readiness and include html as backup
-                    formats = ["markdown", "html"]
+                    remaining_urls.append(url)
 
-                # Always use individual scraping for simplicity and reliability
-                # Batch scraping adds complexity without much benefit for small numbers of URLs
-                results: List[Dict[str, Any]] = []
+            if not remaining_urls:
+                results = spa_results
+            else:
+                safe_urls = remaining_urls
+                backend = _get_backend()
 
-                from tools.interrupt import is_interrupted as _is_interrupted
-                for url in safe_urls:
-                    if _is_interrupted():
-                        results.append({"url": url, "error": "Interrupted", "title": ""})
-                        continue
-
-                    # Website policy check — block before fetching
-                    blocked = check_website_access(url)
-                    if blocked:
-                        logger.info("Blocked web_extract for %s by rule %s", blocked["host"], blocked["rule"])
-                        results.append({
-                            "url": url, "title": "", "content": "",
-                            "error": blocked["message"],
-                            "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
-                        })
-                        continue
-
-                    try:
-                        logger.info("Scraping: %s", url)
-                        # Run synchronous Firecrawl scrape in a thread with a
-                        # 60s timeout so a hung fetch doesn't block the session.
-                        try:
-                            scrape_result = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    _get_firecrawl_client().scrape,
-                                    url=url,
-                                    formats=formats,
-                                ),
-                                timeout=60,
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning("Firecrawl scrape timed out for %s", url)
+                if backend == "parallel":
+                    results = await _parallel_extract(safe_urls)
+                elif backend == "exa":
+                    results = _exa_extract(safe_urls)
+                elif backend == "tavily":
+                    logger.info("Tavily extract: %d URL(s)", len(safe_urls))
+                    raw = _tavily_request("extract", {
+                        "urls": safe_urls,
+                        "include_images": False,
+                    })
+                    results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+                else:
+                    # ── Firecrawl extraction ──
+                    # Determine requested formats for Firecrawl v2
+                    formats: List[str] = []
+                    if format == "markdown":
+                        formats = ["markdown"]
+                    elif format == "html":
+                        formats = ["html"]
+                    else:
+                        # Default: request markdown for LLM-readiness and include html as backup
+                        formats = ["markdown", "html"]
+    
+                    # Always use individual scraping for simplicity and reliability
+                    # Batch scraping adds complexity without much benefit for small numbers of URLs
+                    results: List[Dict[str, Any]] = []
+    
+                    from tools.interrupt import is_interrupted as _is_interrupted
+                    for url in safe_urls:
+                        if _is_interrupted():
+                            results.append({"url": url, "error": "Interrupted", "title": ""})
+                            continue
+    
+                        # Website policy check — block before fetching
+                        blocked = check_website_access(url)
+                        if blocked:
+                            logger.info("Blocked web_extract for %s by rule %s", blocked["host"], blocked["rule"])
                             results.append({
                                 "url": url, "title": "", "content": "",
-                                "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
+                                "error": blocked["message"],
+                                "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
                             })
                             continue
-
-                        scrape_payload = _extract_scrape_payload(scrape_result)
-                        metadata = scrape_payload.get("metadata", {})
-                        title = ""
-                        content_markdown = scrape_payload.get("markdown")
-                        content_html = scrape_payload.get("html")
-
-                        # Ensure metadata is a dict (not an object)
-                        if not isinstance(metadata, dict):
-                            if hasattr(metadata, 'model_dump'):
-                                metadata = metadata.model_dump()
-                            elif hasattr(metadata, '__dict__'):
-                                metadata = metadata.__dict__
-                            else:
-                                metadata = {}
-
-                        # Get title from metadata
-                        title = metadata.get("title", "")
-
-                        # Re-check final URL after redirect
-                        final_url = metadata.get("sourceURL", url)
-                        final_blocked = check_website_access(final_url)
-                        if final_blocked:
-                            logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
+    
+                        try:
+                            logger.info("Scraping: %s", url)
+                            # Run synchronous Firecrawl scrape in a thread with a
+                            # 60s timeout so a hung fetch doesn't block the session.
+                            try:
+                                scrape_result = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        _get_firecrawl_client().scrape,
+                                        url=url,
+                                        formats=formats,
+                                    ),
+                                    timeout=60,
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning("Firecrawl scrape timed out for %s", url)
+                                results.append({
+                                    "url": url, "title": "", "content": "",
+                                    "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
+                                })
+                                continue
+    
+                            scrape_payload = _extract_scrape_payload(scrape_result)
+                            metadata = scrape_payload.get("metadata", {})
+                            title = ""
+                            content_markdown = scrape_payload.get("markdown")
+                            content_html = scrape_payload.get("html")
+    
+                            # Ensure metadata is a dict (not an object)
+                            if not isinstance(metadata, dict):
+                                if hasattr(metadata, 'model_dump'):
+                                    metadata = metadata.model_dump()
+                                elif hasattr(metadata, '__dict__'):
+                                    metadata = metadata.__dict__
+                                else:
+                                    metadata = {}
+    
+                            # Get title from metadata
+                            title = metadata.get("title", "")
+    
+                            # Re-check final URL after redirect
+                            final_url = metadata.get("sourceURL", url)
+                            final_blocked = check_website_access(final_url)
+                            if final_blocked:
+                                logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
+                                results.append({
+                                    "url": final_url, "title": title, "content": "", "raw_content": "",
+                                    "error": final_blocked["message"],
+                                    "blocked_by_policy": {"host": final_blocked["host"], "rule": final_blocked["rule"], "source": final_blocked["source"]},
+                                })
+                                continue
+    
+                            # Choose content based on requested format
+                            chosen_content = content_markdown if (format == "markdown" or (format is None and content_markdown)) else content_html or content_markdown or ""
+    
                             results.append({
-                                "url": final_url, "title": title, "content": "", "raw_content": "",
-                                "error": final_blocked["message"],
-                                "blocked_by_policy": {"host": final_blocked["host"], "rule": final_blocked["rule"], "source": final_blocked["source"]},
+                                "url": final_url,
+                                "title": title,
+                                "content": chosen_content,
+                                "raw_content": chosen_content,
+                                "metadata": metadata  # Now guaranteed to be a dict
                             })
-                            continue
-
-                        # Choose content based on requested format
-                        chosen_content = content_markdown if (format == "markdown" or (format is None and content_markdown)) else content_html or content_markdown or ""
-
-                        results.append({
-                            "url": final_url,
-                            "title": title,
-                            "content": chosen_content,
-                            "raw_content": chosen_content,
-                            "metadata": metadata  # Now guaranteed to be a dict
-                        })
-
-                    except Exception as scrape_err:
-                        logger.debug("Scrape failed for %s: %s", url, scrape_err)
-                        results.append({
-                            "url": url,
-                            "title": "",
-                            "content": "",
-                            "raw_content": "",
-                            "error": str(scrape_err)
-                        })
-
+    
+                        except Exception as scrape_err:
+                            logger.debug("Scrape failed for %s: %s", url, scrape_err)
+                            results.append({
+                                "url": url,
+                                "title": "",
+                                "content": "",
+                                "raw_content": "",
+                                "error": str(scrape_err)
+                            })
+    
+            results = spa_results + results
         # Merge any SSRF-blocked results back in
         if ssrf_blocked:
             results = ssrf_blocked + results
