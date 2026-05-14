@@ -1300,18 +1300,21 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
-            # ── Playwright fallback for known SPA/CSR sites ──
-            spa_results, remaining_urls = [], []
+            # ── Playwright first, fallback to Firecrawl if blocked/empty ──
+            pw_results, firecrawl_urls = [], []
             for url in safe_urls:
-                if _is_spa_url(url):
-                    spa_results.append(_playwright_extract_sync(url))
+                r = _playwright_extract_sync(url)
+                if r.get("error") or len(r.get("content", "")) < 100:
+                    logger.info("Playwright insufficient for %s (len=%d err=%s), falling back to Firecrawl",
+                                url, len(r.get("content", "")), r.get("error"))
+                    firecrawl_urls.append(url)
                 else:
-                    remaining_urls.append(url)
+                    pw_results.append(r)
 
-            if not remaining_urls:
-                results = spa_results
+            if not firecrawl_urls:
+                results = pw_results
             else:
-                safe_urls = remaining_urls
+                safe_urls = firecrawl_urls
                 backend = _get_backend()
 
                 if backend == "parallel":
@@ -1430,7 +1433,7 @@ async def web_extract_tool(
                                 "error": str(scrape_err)
                             })
     
-            results = spa_results + results
+            results = pw_results + results
         # Merge any SSRF-blocked results back in
         if ssrf_blocked:
             results = ssrf_blocked + results
