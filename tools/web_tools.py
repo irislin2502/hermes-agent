@@ -1174,6 +1174,22 @@ _SPA_DOMAINS = {
     "www.notion.so",
     "figma.com",
     "www.figma.com",
+    # Job boards — Taiwan
+    "104.com.tw",
+    "www.104.com.tw",
+    "1111.com.tw",
+    "www.1111.com.tw",
+    "yourator.co",
+    "www.yourator.co",
+    # ATS / job platforms
+    "jobs.lever.co",
+    "greenhouse.io",
+    "boards.greenhouse.io",
+    "apply.workable.com",
+    "workable.com",
+    # Other SPA sites
+    "indeed.com",
+    "www.indeed.com",
 }
 
 
@@ -1205,103 +1221,6 @@ def _playwright_extract_sync(url: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("Playwright extraction failed for %s: %s", url, e)
         return {"url": url, "title": "", "content": "", "raw_content": "", "error": str(e)}
-
-
-# ─── SPA / CSR Playwright fallback ───────────────────────────────────────────
-
-# Known client-side-rendered / SPA domains that yield empty HTML without JS execution.
-_SPA_DOMAINS = {
-    "cake.me",
-    "linkedin.com",
-    "www.linkedin.com",
-    "jobs.lever.co",
-    "greenhouse.io",
-    "boards.greenhouse.io",
-    "workable.com",
-    "apply.workable.com",
-    "notion.so",
-    "www.notion.so",
-    "glassdoor.com",
-    "www.glassdoor.com",
-    "indeed.com",
-    "www.indeed.com",
-    "104.com.tw",
-    "www.104.com.tw",
-    "1111.com.tw",
-    "www.1111.com.tw",
-    "yourator.co",
-    "www.yourator.co",
-}
-
-
-def _is_spa_url(url: str) -> bool:
-    """Return True when *url* belongs to a known SPA/CSR domain."""
-    from urllib.parse import urlparse
-    try:
-        host = urlparse(url).netloc.lower()
-        # Strip port number if present
-        host = host.split(":")[0]
-        return host in _SPA_DOMAINS
-    except Exception:
-        return False
-
-
-def _playwright_extract_sync(url: str, timeout_ms: int = 30000) -> Dict[str, Any]:
-    """Use Playwright (headless Chromium) to fully render a SPA page and extract its content.
-
-    Returns a document dict compatible with the standard extraction result format:
-    ``{url, title, content, raw_content, metadata}``.
-    Falls back to an error dict on failure.
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-        import re as _re
-
-        logger.info("Playwright SPA extract: %s", url)
-
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            try:
-                context = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 900},
-                )
-                page = context.new_page()
-                page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-                title = page.title()
-                # Extract visible text content via innerText (skips script/style)
-                html = page.content()
-                raw_text = page.evaluate("() => document.body ? document.body.innerText : ''")
-                # Clean up excessive whitespace
-                raw_text = _re.sub(r"\n{3,}", "\n\n", raw_text).strip()
-            finally:
-                browser.close()
-
-        return {
-            "url": url,
-            "title": title,
-            "content": raw_text,
-            "raw_content": raw_text,
-            "metadata": {
-                "sourceURL": url,
-                "title": title,
-                "extraction_method": "playwright",
-            },
-        }
-
-    except Exception as exc:
-        logger.warning("Playwright extract failed for %s: %s", url, exc)
-        return {
-            "url": url,
-            "title": "",
-            "content": "",
-            "raw_content": "",
-            "error": f"Playwright extraction failed: {exc}",
-            "metadata": {"sourceURL": url},
-        }
 
 
 async def web_extract_tool(
