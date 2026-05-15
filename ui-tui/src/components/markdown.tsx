@@ -417,11 +417,61 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
   })
 
   // Post-render safety condition: compute max line width.
-  // If any line exceeds available space, vertical fallback should catch it (Task 4).
   const maxLineWidth = Math.max(...allEntries.map(e => stringWidth(e.text)))
   const safetyOverflow = cols != null && maxLineWidth > cols - TABLE_PADDING_LEFT - SAFETY_MARGIN
 
-  // Render wrapped rows — one <Text> per visual line.
+  // Scaled vertical threshold — 2-3 col tables stay tabular even with tall cells
+  const maxRowLinesThreshold = numCols <= 3 ? 8 : numCols <= 6 ? 5 : 4
+  const tallestRow = normalizedRows.length > 1
+    ? Math.max(...normalizedRows.slice(1).map(row =>
+        Math.max(...row.map((cell, ci) =>
+          wrapCell(cell, columnWidths[ci]!, isHard).length
+        ), 1)
+      ))
+    : 0
+
+  const useVertical = tallestRow > maxRowLinesThreshold || safetyOverflow
+
+  if (useVertical) {
+    // Edge case: header-only table
+    if (normalizedRows.length <= 1) {
+      return (
+        <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
+          <Text bold color={t.color.accent} wrap="wrap-trim">
+            {normalizedRows[0]!.map(h => stripInlineMarkup(h)).join(' · ')}
+          </Text>
+        </Box>
+      )
+    }
+
+    const headers = normalizedRows[0]!
+    const dataRows = normalizedRows.slice(1)
+    const sepWidth = Math.max(1, cols ? Math.min(cols - TABLE_PADDING_LEFT - 1, 40) : 40)
+
+    return (
+      <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
+        {dataRows.map((row, ri) => (
+          <Fragment key={ri}>
+            {ri > 0 ? (
+              <Text color={t.color.muted} dimColor>{'─'.repeat(sepWidth)}</Text>
+            ) : null}
+            {headers.map((header, ci) => {
+              const cell = row[ci] ?? ''
+              const label = stripInlineMarkup(header) || `Col ${ci + 1}`
+              return (
+                <Text key={ci} wrap="wrap-trim">
+                  <Text bold color={t.color.accent}>{label}:</Text>
+                  {' '}{stripInlineMarkup(cell)}
+                </Text>
+              )
+            })}
+          </Fragment>
+        ))}
+      </Box>
+    )
+  }
+
+  // Render wrapped horizontal rows — one <Text> per visual line.
   return (
     <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
       {allEntries.map((entry, i) => (
